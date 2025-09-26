@@ -11,12 +11,13 @@ namespace StarMapViewer
 {
     public partial class MainWindow : Window
     {
-        const string TilesRoot = "C:\\Users\\17917\\Desktop\\scgd_general_wpf\\x64\\Debug\\tiles"; // tiles/{zoom}/{x}_{y}.jpg
+        const string DefaultTilesRoot = "C\\Users\\17917\\Desktop\\scgd_general_wpf\\x64\\Debug\\tiles"; // tiles/{zoom}/{x}_{y}.jpg
+        private string _tilesRoot = DefaultTilesRoot; // 可变瓦片根目录
         const int MaxZoomLevel = 5;   // 瓦片最高级别(数据上限)
 
         double _scale = 1.0;          // 当前缩放(屏幕像素/世界像素)
         double _minScale = 0.01;      // 适配整图最小缩放
-        Point _offset = new(0, 0);    // 屏幕平移
+        System.Windows.Point _offset = new(0, 0);    // 屏幕平移
         bool _transformDirty = true;  // 仅坐标或缩放变化
 
         int _zoom = 0;                // 当前瓦片级别 (0 = 只有一张整图)
@@ -24,7 +25,7 @@ namespace StarMapViewer
         int _worldHeight = 0;         // 0级整图高
         bool _worldSizeLoaded = false;
 
-        readonly Dictionary<(int x, int y), Image> _activeImages = new();
+        readonly Dictionary<(int x, int y), System.Windows.Controls.Image> _activeImages = new();
         readonly Dictionary<string, BitmapImage> _bmpCache = new();
         readonly LinkedList<string> _lru = new();
         const int CacheCapacity = 1024;
@@ -47,6 +48,20 @@ namespace StarMapViewer
             Loaded += (_, __) => { _fitPending = true; MarkTilesDirty(); };
         }
 
+        void ResetWorldState()
+        {
+            ClearAllActiveTiles();
+            _worldSizeLoaded = false;
+            _worldWidth = _worldHeight = 0;
+            _zoom = 0;
+            _lastZoom = -1;
+            _firstFit = true;
+            _fitPending = true;
+            _offset = new System.Windows.Point(0, 0);
+            _scale = 1.0;
+            MarkTilesDirty();
+        }
+
         #region Helpers
         int TileCountPerAxis(int zoom) => 1 << zoom; // 2^zoom
         double WorldTileWidth(int zoom) => (double)_worldWidth / TileCountPerAxis(zoom);
@@ -55,7 +70,7 @@ namespace StarMapViewer
         void MarkTilesDirty() { _tilesDirty = true; _transformDirty = true; }
         void MarkTransformDirtyOnly() => _transformDirty = true;
 
-        void PlaceTile(Image img, int tx, int ty, double drawTileW, double drawTileH)
+        void PlaceTile(System.Windows.Controls.Image img, int tx, int ty, double drawTileW, double drawTileH)
         {
             var src = PresentationSource.FromVisual(this);
             double dx = 1.0, dy = 1.0;
@@ -96,8 +111,6 @@ namespace StarMapViewer
             if (desired != _zoom)
             {
                 _zoom = desired;
-                // 不立即清空画布，先保留旧级别瓦片直到新级别加载 (减少闪白)
-                // 但为防止索引冲突仍需清空，随后立即加载新瓦片（强制取消节流）
                 ClearAllActiveTiles();
                 _forceImmediateTileLoad = true;
                 MarkTilesDirty();
@@ -108,7 +121,7 @@ namespace StarMapViewer
         #region Cache
         BitmapImage? LoadTile(int zoom, int x, int y)
         {
-            string path = Path.Combine(TilesRoot, zoom.ToString(), $"{x}_{y}.jpg");
+            string path = Path.Combine(_tilesRoot, zoom.ToString(), $"{x}_{y}.jpg");
             if (!File.Exists(path)) return null;
             if (_bmpCache.TryGetValue(path, out var cached)) { Promote(path); return cached; }
             try
@@ -142,7 +155,6 @@ namespace StarMapViewer
 
         void ClearAllCaches()
         {
-            // 解除 Image Source 引用，加速回收
             foreach (var kv in _activeImages)
             {
                 kv.Value.Source = null;
@@ -162,7 +174,7 @@ namespace StarMapViewer
         {
             foreach (var kv in _activeImages)
             {
-                kv.Value.Source = null; // 解除引用
+                kv.Value.Source = null;
                 MainCanvas.Children.Remove(kv.Value);
             }
             _activeImages.Clear();
@@ -173,7 +185,7 @@ namespace StarMapViewer
         void EnsureWorldSize()
         {
             if (_worldSizeLoaded) return;
-            string p = Path.Combine(TilesRoot, "0", "0_0.jpg");
+            string p = Path.Combine(_tilesRoot, "0", "0_0.jpg");
             if (!File.Exists(p)) return;
             try
             {
@@ -262,7 +274,7 @@ namespace StarMapViewer
             double tileH = WorldTileHeight(_zoom);
             int tx = (int)Math.Floor(centerX / tileW);
             int ty = (int)Math.Floor(centerY / tileH);
-            var names = new List<string>();
+            var names = new System.Collections.Generic.List<string>();
             for (int dy = 0; dy <= 1; dy++)
             {
                 for (int dx = 0; dx <= 1; dx++)
@@ -328,7 +340,7 @@ namespace StarMapViewer
                     needed.Add((tx, ty));
                     if (!_activeImages.TryGetValue((tx, ty), out var img))
                     {
-                        img = new Image { Visibility = Visibility.Hidden, SnapsToDevicePixels = true, UseLayoutRounding = true, Stretch = Stretch.Fill };
+                        img = new System.Windows.Controls.Image { Visibility = Visibility.Hidden, SnapsToDevicePixels = true, UseLayoutRounding = true, Stretch = Stretch.Fill };
                         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.NearestNeighbor);
                         _activeImages[(tx, ty)] = img;
                         MainCanvas.Children.Add(img);
@@ -342,7 +354,7 @@ namespace StarMapViewer
             }
             if (_activeImages.Count > needed.Count)
             {
-                var remove = new List<(int, int)>();
+                var remove = new System.Collections.Generic.List<(int, int)>();
                 foreach (var kv in _activeImages) if (!needed.Contains(kv.Key)) remove.Add(kv.Key);
                 foreach (var key in remove) { _activeImages[key].Source = null; MainCanvas.Children.Remove(_activeImages[key]); _activeImages.Remove(key); }
             }
@@ -355,20 +367,20 @@ namespace StarMapViewer
             double old = _scale;
             _scale *= e.Delta > 0 ? 1.1 : 0.9;
             if (_scale < _minScale) _scale = _minScale; // 仅保持不小于适配比例
-            Point m = e.GetPosition(MainCanvas);
+            System.Windows.Point m = e.GetPosition(MainCanvas);
             _offset.X = m.X - (m.X - _offset.X) * (_scale / old);
             _offset.Y = m.Y - (m.Y - _offset.Y) * (_scale / old);
             MarkTransformDirtyOnly();
             CheckIfRangeChanged();
         }
-        Point _last;
+        System.Windows.Point _last;
         private void MainCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         { _last = e.GetPosition(this); MainCanvas.CaptureMouse(); }
-        private void MainCanvas_MouseMove(object sender, MouseEventArgs e)
+        private void MainCanvas_MouseMove(object sender, System.Windows.Input.MouseEventArgs e)
         {
             if (MainCanvas.IsMouseCaptured)
             {
-                Point p = e.GetPosition(this);
+                System.Windows.Point p = e.GetPosition(this);
                 _offset.X += p.X - _last.X;
                 _offset.Y += p.Y - _last.Y;
                 _last = p;
@@ -382,6 +394,29 @@ namespace StarMapViewer
         private void ClearCacheBtn_Click(object sender, RoutedEventArgs e)
         {
             ClearAllCaches();
+        }
+
+        private void ClearViewBtn_Click(object sender, RoutedEventArgs e)
+        {
+            ClearAllActiveTiles();
+            MarkTilesDirty();
+        }
+
+        private void OpenRootBtn_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new System.Windows.Forms.FolderBrowserDialog();
+            dlg.Description = "选择 Tiles 根目录 (包含 0/0_0.jpg)";
+            dlg.SelectedPath = _tilesRoot;
+            if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                if (!string.IsNullOrWhiteSpace(dlg.SelectedPath) && Directory.Exists(dlg.SelectedPath))
+                {
+                    _tilesRoot = dlg.SelectedPath;
+                    ClearAllCaches();
+                    ResetWorldState();
+                }
+            }
+            dlg.Dispose();
         }
         #endregion
     }

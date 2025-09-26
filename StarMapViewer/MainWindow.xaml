@@ -22,13 +22,16 @@
                    Background="#AAFFFFFF"
                    Padding="4,2"
                    Text="(0, 0)" />
-        <Button x:Name="ClearCacheBtn"
-                Content="清空缓存"
-                HorizontalAlignment="Left"
-                VerticalAlignment="Top"
-                Margin="10"
-                Padding="8,2"
-                Background="#AAFFFFFF"
-                Click="ClearCacheBtn_Click"/>
+        <!-- Buttons group -->
+        <StackPanel Orientation="Horizontal"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Top"
+                    Margin="10"
+                    Background="#AAFFFFFF"
+                    Opacity="0.95">
+            <Button x:Name="OpenRootBtn" Content="打开目录" Margin="0,0,6,0" Padding="8,2" Click="OpenRootBtn_Click"/>
+            <Button x:Name="ClearViewBtn" Content="清除画布" Margin="0,0,6,0" Padding="8,2" Click="ClearViewBtn_Click"/>
+            <Button x:Name="ClearCacheBtn" Content="清空缓存" Padding="8,2" Click="ClearCacheBtn_Click"/>
+        </StackPanel>
     </Grid>
 </Window>
