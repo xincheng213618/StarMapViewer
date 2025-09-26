@@ -27,7 +27,7 @@ namespace StarMapViewer
         readonly Dictionary<(int x, int y), Image> _activeImages = new();
         readonly Dictionary<string, BitmapImage> _bmpCache = new();
         readonly LinkedList<string> _lru = new();
-        const int CacheCapacity = 128;
+        const int CacheCapacity = 1024;
 
         bool _fitPending = true;      // 需要执行自适应
         bool _firstFit = true;        // 首次适配标记
@@ -113,10 +113,11 @@ namespace StarMapViewer
             if (_bmpCache.TryGetValue(path, out var cached)) { Promote(path); return cached; }
             try
             {
+                using var fs = File.OpenRead(path);
                 var bmp = new BitmapImage();
                 bmp.BeginInit();
-                bmp.CacheOption = BitmapCacheOption.OnLoad;
-                bmp.UriSource = new Uri(path, UriKind.Absolute);
+                bmp.CacheOption = BitmapCacheOption.OnLoad; // 读取到内存后释放文件句柄
+                bmp.StreamSource = fs;
                 bmp.EndInit();
                 bmp.Freeze();
                 _bmpCache[path] = bmp;
@@ -134,14 +135,36 @@ namespace StarMapViewer
         void Evict()
         {
             while (_bmpCache.Count > CacheCapacity && _lru.Last != null)
-            { var victim = _lru.Last.Value; _lru.RemoveLast(); _bmpCache.Remove(victim); }
+            {
+                var victim = _lru.Last.Value; _lru.RemoveLast(); _bmpCache.Remove(victim);
+            }
+        }
+
+        void ClearAllCaches()
+        {
+            // 解除 Image Source 引用，加速回收
+            foreach (var kv in _activeImages)
+            {
+                kv.Value.Source = null;
+                MainCanvas.Children.Remove(kv.Value);
+            }
+            _activeImages.Clear();
+            _bmpCache.Clear();
+            _lru.Clear();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
         }
         #endregion
 
         #region Active Tiles
         void ClearAllActiveTiles()
         {
-            foreach (var kv in _activeImages) MainCanvas.Children.Remove(kv.Value);
+            foreach (var kv in _activeImages)
+            {
+                kv.Value.Source = null; // 解除引用
+                MainCanvas.Children.Remove(kv.Value);
+            }
             _activeImages.Clear();
         }
         #endregion
@@ -321,7 +344,7 @@ namespace StarMapViewer
             {
                 var remove = new List<(int, int)>();
                 foreach (var kv in _activeImages) if (!needed.Contains(kv.Key)) remove.Add(kv.Key);
-                foreach (var key in remove) { MainCanvas.Children.Remove(_activeImages[key]); _activeImages.Remove(key); }
+                foreach (var key in remove) { _activeImages[key].Source = null; MainCanvas.Children.Remove(_activeImages[key]); _activeImages.Remove(key); }
             }
         }
 
@@ -355,6 +378,11 @@ namespace StarMapViewer
         }
         private void MainCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         { MainCanvas.ReleaseMouseCapture(); }
+
+        private void ClearCacheBtn_Click(object sender, RoutedEventArgs e)
+        {
+            ClearAllCaches();
+        }
         #endregion
     }
 }
