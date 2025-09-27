@@ -6,6 +6,8 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Collections.Generic;
 using System.IO;
+using StarMapViewer.Services;
+using System.Linq;
 
 namespace StarMapViewer
 {
@@ -21,15 +23,6 @@ namespace StarMapViewer
         bool _transformDirty = true;  // 仅坐标或缩放变化
 
         int _zoom = 0;                // 当前瓦片级别 (0 = 只有一张整图)
-        int _worldWidth = 0;          // 0级整图宽
-        int _worldHeight = 0;         // 0级整图高
-        bool _worldSizeLoaded = false;
-
-        readonly Dictionary<(int x, int y), System.Windows.Controls.Image> _activeImages = new();
-        readonly Dictionary<string, BitmapImage> _bmpCache = new();
-        readonly LinkedList<string> _lru = new();
-        const int CacheCapacity = 1024;
-
         bool _fitPending = true;      // 需要执行自适应
         bool _firstFit = true;        // 首次适配标记
 
@@ -39,6 +32,15 @@ namespace StarMapViewer
         bool _forceImmediateTileLoad = false; // 缩放级别切换时立即加载以避免白屏
 
         int _frameCounter = 0;        // 渲染帧计数
+
+        // Service instances
+        private readonly TileCacheService _cacheService = new();
+        private readonly TileRenderService _renderService = new();
+        private readonly WorldCoordinateService _worldService = new();
+        private readonly VisibleRangeService _rangeService = new();
+        private readonly ActiveTileService _tileService = new();
+        private readonly InteractionService _interactionService = new();
+        private readonly CoordinateDisplayService _coordinateService = new();
 
         public MainWindow()
         {
@@ -50,9 +52,8 @@ namespace StarMapViewer
 
         void ResetWorldState()
         {
-            ClearAllActiveTiles();
-            _worldSizeLoaded = false;
-            _worldWidth = _worldHeight = 0;
+            _tileService.ClearAllActiveTiles(MainCanvas);
+            _worldService.Reset();
             _zoom = 0;
             _lastZoom = -1;
             _firstFit = true;
@@ -63,55 +64,19 @@ namespace StarMapViewer
         }
 
         #region Helpers
-        int TileCountPerAxis(int zoom) => 1 << zoom; // 2^zoom
-        double WorldTileWidth(int zoom) => (double)_worldWidth / TileCountPerAxis(zoom);
-        double WorldTileHeight(int zoom) => (double)_worldHeight / TileCountPerAxis(zoom);
-
         void MarkTilesDirty() { _tilesDirty = true; _transformDirty = true; }
         void MarkTransformDirtyOnly() => _transformDirty = true;
-
-        void PlaceTile(System.Windows.Controls.Image img, int tx, int ty, double drawTileW, double drawTileH)
-        {
-            var src = PresentationSource.FromVisual(this);
-            double dx = 1.0, dy = 1.0;
-            if (src != null)
-            {
-                dx = src.CompositionTarget.TransformToDevice.M11;
-                dy = src.CompositionTarget.TransformToDevice.M22;
-            }
-            double left = _offset.X + tx * drawTileW;
-            double top = _offset.Y + ty * drawTileH;
-            double right = _offset.X + (tx + 1) * drawTileW;
-            double bottom = _offset.Y + (ty + 1) * drawTileH;
-            double dLeft = Math.Round(left * dx);
-            double dTop = Math.Round(top * dy);
-            double dRight = Math.Round(right * dx);
-            double dBottom = Math.Round(bottom * dy);
-            double snappedLeft = dLeft / dx;
-            double snappedTop = dTop / dy;
-            double snappedWidth = (dRight - dLeft) / dx;
-            double snappedHeight = (dBottom - dTop) / dy;
-            Canvas.SetLeft(img, snappedLeft);
-            Canvas.SetTop(img, snappedTop);
-            img.Width = snappedWidth;
-            img.Height = snappedHeight;
-        }
         #endregion
 
         #region Zoom selection
         // 根据当前缩放倍率选取瓦片级别：scale 相对 fitScale 的 2 对数（>=1 时才进入更高层级）
         void UpdateDesiredZoomLevel()
         {
-            if (_scale <= 0 || _minScale <= 0) return;
-            double rel = _scale / _minScale; // >=1
-            double target = Math.Log(rel, 2.0); // 1->0,2->1,4->2...
-            int desired = (int)Math.Floor(target + 1e-6);
-            if (desired < 0) desired = 0;
-            if (desired > MaxZoomLevel) desired = MaxZoomLevel;
+            int desired = _renderService.UpdateDesiredZoomLevel(_scale, _minScale, _zoom, MaxZoomLevel);
             if (desired != _zoom)
             {
                 _zoom = desired;
-                ClearAllActiveTiles();
+                _tileService.ClearAllActiveTiles(MainCanvas);
                 _forceImmediateTileLoad = true;
                 MarkTilesDirty();
             }
@@ -119,107 +84,40 @@ namespace StarMapViewer
         #endregion
 
         #region Cache
-        BitmapImage? LoadTile(int zoom, int x, int y)
-        {
-            string path = Path.Combine(_tilesRoot, zoom.ToString(), $"{x}_{y}.jpg");
-            if (!File.Exists(path)) return null;
-            if (_bmpCache.TryGetValue(path, out var cached)) { Promote(path); return cached; }
-            try
-            {
-                using var fs = File.OpenRead(path);
-                var bmp = new BitmapImage();
-                bmp.BeginInit();
-                bmp.CacheOption = BitmapCacheOption.OnLoad; // 读取到内存后释放文件句柄
-                bmp.StreamSource = fs;
-                bmp.EndInit();
-                bmp.Freeze();
-                _bmpCache[path] = bmp;
-                _lru.AddFirst(path);
-                Evict();
-                return bmp;
-            }
-            catch { return null; }
-        }
-        void Promote(string path)
-        {
-            var node = _lru.Find(path);
-            if (node != null && node != _lru.First) { _lru.Remove(node); _lru.AddFirst(node); }
-        }
-        void Evict()
-        {
-            while (_bmpCache.Count > CacheCapacity && _lru.Last != null)
-            {
-                var victim = _lru.Last.Value; _lru.RemoveLast(); _bmpCache.Remove(victim);
-            }
-        }
-
         void ClearAllCaches()
         {
-            foreach (var kv in _activeImages)
-            {
-                kv.Value.Source = null;
-                MainCanvas.Children.Remove(kv.Value);
-            }
-            _activeImages.Clear();
-            _bmpCache.Clear();
-            _lru.Clear();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
+            _tileService.ClearAllActiveTiles(MainCanvas);
+            _cacheService.ClearCache();
         }
         #endregion
 
-        #region Active Tiles
-        void ClearAllActiveTiles()
-        {
-            foreach (var kv in _activeImages)
-            {
-                kv.Value.Source = null;
-                MainCanvas.Children.Remove(kv.Value);
-            }
-            _activeImages.Clear();
-        }
+        #region Active Tiles (managed by service)
         #endregion
 
         #region World size & Fit
         void EnsureWorldSize()
         {
-            if (_worldSizeLoaded) return;
-            string p = Path.Combine(_tilesRoot, "0", "0_0.jpg");
-            if (!File.Exists(p)) return;
-            try
+            _worldService.EnsureWorldSize(_tilesRoot);
+            if (_worldService.WorldSizeLoaded)
             {
-                var bmp = new BitmapImage();
-                bmp.BeginInit();
-                bmp.CacheOption = BitmapCacheOption.OnLoad;
-                bmp.UriSource = new Uri(p, UriKind.Absolute);
-                bmp.EndInit();
-                _worldWidth = bmp.PixelWidth;
-                _worldHeight = bmp.PixelHeight;
-                _worldSizeLoaded = true;
                 _fitPending = true;
                 MarkTilesDirty();
             }
-            catch { }
         }
 
         void FitToViewIfNeeded()
         {
-            if (!_worldSizeLoaded || !_fitPending) return;
+            if (!_worldService.WorldSizeLoaded || !_fitPending) return;
             if (MainCanvas.ActualWidth <= 0 || MainCanvas.ActualHeight <= 0) return;
-            double fitScale = Math.Min(MainCanvas.ActualWidth / _worldWidth, MainCanvas.ActualHeight / _worldHeight);
-            _minScale = fitScale;
-            if (_firstFit)
-            {
-                _scale = fitScale; // 首次强制适配 => zoom 0
-                _firstFit = false;
-            }
-            else if (_scale < _minScale)
-            {
-                _scale = _minScale;
-            }
-            _offset.X = (MainCanvas.ActualWidth - _worldWidth * _scale) / 2.0;
-            _offset.Y = (MainCanvas.ActualHeight - _worldHeight * _scale) / 2.0;
+
+            var (newScale, newOffset) = _worldService.FitToView(
+                MainCanvas.ActualWidth, MainCanvas.ActualHeight, 
+                _scale, _offset, _firstFit);
+            
+            _minScale = _worldService.GetMinScale(MainCanvas.ActualWidth, MainCanvas.ActualHeight);
+            _scale = newScale;
+            _offset = newOffset;
+            _firstFit = false;
             _fitPending = false;
             MarkTransformDirtyOnly();
         }
@@ -228,32 +126,16 @@ namespace StarMapViewer
         #region Visible range computation
         bool ComputeVisibleTileRange(out int tx0, out int ty0, out int tx1, out int ty1)
         {
-            tx0 = ty0 = tx1 = ty1 = 0;
-            if (!_worldSizeLoaded) return false;
-            if (MainCanvas.ActualWidth <= 0 || MainCanvas.ActualHeight <= 0) return false;
-
-            double tileW = WorldTileWidth(_zoom);
-            double tileH = WorldTileHeight(_zoom);
-            double invScale = 1.0 / _scale;
-            double worldLeft = (-_offset.X) * invScale;
-            double worldTop = (-_offset.Y) * invScale;
-            double worldRight = worldLeft + MainCanvas.ActualWidth * invScale;
-            double worldBottom = worldTop + MainCanvas.ActualHeight * invScale;
-
-            int tilesPerAxis = TileCountPerAxis(_zoom);
-            int maxIndex = tilesPerAxis - 1;
-
-            tx0 = (int)Math.Floor(worldLeft / tileW) - 1; if (tx0 < 0) tx0 = 0;
-            ty0 = (int)Math.Floor(worldTop / tileH) - 1; if (ty0 < 0) ty0 = 0;
-            tx1 = (int)Math.Floor(worldRight / tileW) + 1; if (tx1 > maxIndex) tx1 = maxIndex;
-            ty1 = (int)Math.Floor(worldBottom / tileH) + 1; if (ty1 > maxIndex) ty1 = maxIndex;
-            return true;
+            return _rangeService.ComputeVisibleTileRange(
+                MainCanvas.ActualWidth, MainCanvas.ActualHeight,
+                _scale, _offset, _worldService.WorldWidth, _worldService.WorldHeight, _zoom,
+                out tx0, out ty0, out tx1, out ty1);
         }
 
         void CheckIfRangeChanged()
         {
             if (!ComputeVisibleTileRange(out int tx0, out int ty0, out int tx1, out int ty1)) return;
-            if (_lastZoom != _zoom || tx0 != _lastTx0 || ty0 != _lastTy0 || tx1 != _lastTx1 || ty1 != _lastTy1)
+            if (_rangeService.HasRangeChanged(_zoom, tx0, ty0, tx1, ty1, _lastZoom, _lastTx0, _lastTy0, _lastTx1, _lastTy1))
             {
                 _lastZoom = _zoom; _lastTx0 = tx0; _lastTy0 = ty0; _lastTx1 = tx1; _lastTy1 = ty1;
                 MarkTilesDirty();
@@ -265,35 +147,17 @@ namespace StarMapViewer
         {
             var coordText = this.FindName("CoordText") as TextBlock;
             if (coordText == null) return;
-            if (!_worldSizeLoaded || MainCanvas.ActualWidth <= 0 || MainCanvas.ActualHeight <= 0) { coordText.Text = ""; return; }
-            double centerX = (MainCanvas.ActualWidth / 2.0 - _offset.X) / _scale;
-            double centerY = (MainCanvas.ActualHeight / 2.0 - _offset.Y) / _scale;
-            int tileCount = _activeImages.Count;
-            int tilesPerAxis = TileCountPerAxis(_zoom);
-            double tileW = WorldTileWidth(_zoom);
-            double tileH = WorldTileHeight(_zoom);
-            int tx = (int)Math.Floor(centerX / tileW);
-            int ty = (int)Math.Floor(centerY / tileH);
-            var names = new System.Collections.Generic.List<string>();
-            for (int dy = 0; dy <= 1; dy++)
-            {
-                for (int dx = 0; dx <= 1; dx++)
-                {
-                    int nx = tx + dx;
-                    int ny = ty + dy;
-                    if (nx < tilesPerAxis && ny < tilesPerAxis)
-                    {
-                        double left = nx * tileW, right = (nx + 1) * tileW;
-                        double top = ny * tileH, bottom = (ny + 1) * tileH;
-                        if (centerX >= left && centerX <= right && centerY >= top && centerY <= bottom)
-                            names.Add($"{nx}_{ny}");
-                    }
-                }
+            if (!_worldService.WorldSizeLoaded) 
+            { 
+                coordText.Text = ""; 
+                return; 
             }
-            if (names.Count == 0) names.Add($"{tx}_{ty}");
-            if (names.Count > 4) names = names.GetRange(0, 4);
-            string tileNames = string.Join(", ", names);
-            coordText.Text = $"Level: {_zoom} | Tiles: {tileCount} | ({centerX:F0}, {centerY:F0}) | {tileNames}";
+
+            coordText.Text = _coordinateService.GenerateCoordinateText(
+                MainCanvas.ActualWidth, MainCanvas.ActualHeight,
+                _offset, _scale, _zoom, _tileService.TileCount,
+                _worldService.WorldWidth, _worldService.WorldHeight,
+                _renderService);
         }
 
         void OnRenderFrame(object? sender, EventArgs e)
@@ -301,22 +165,22 @@ namespace StarMapViewer
             _frameCounter++;
             EnsureWorldSize();
             FitToViewIfNeeded();
-            if (!_worldSizeLoaded) return;
+            if (!_worldService.WorldSizeLoaded) return;
             UpdateDesiredZoomLevel();
             CheckIfRangeChanged();
             UpdateCoordText();
 
-            double tileWorldW = WorldTileWidth(_zoom);
-            double tileWorldH = WorldTileHeight(_zoom);
+            double tileWorldW = _renderService.WorldTileWidth(_worldService.WorldWidth, _zoom);
+            double tileWorldH = _renderService.WorldTileHeight(_worldService.WorldHeight, _zoom);
             double drawTileW = tileWorldW * _scale;
             double drawTileH = tileWorldH * _scale;
 
             if (!_tilesDirty && _transformDirty)
             {
-                foreach (var kv in _activeImages)
+                foreach (var kv in _tileService.ActiveImages)
                 {
                     var (tx, ty) = kv.Key;
-                    PlaceTile(kv.Value, tx, ty, drawTileW, drawTileH);
+                    _renderService.PlaceTile(kv.Value, tx, ty, drawTileW, drawTileH, _offset, this);
                 }
                 _transformDirty = false;
                 return;
@@ -338,58 +202,51 @@ namespace StarMapViewer
                 for (int tx = tx0; tx <= tx1; tx++)
                 {
                     needed.Add((tx, ty));
-                    if (!_activeImages.TryGetValue((tx, ty), out var img))
-                    {
-                        img = new System.Windows.Controls.Image { Visibility = Visibility.Hidden, SnapsToDevicePixels = true, UseLayoutRounding = true, Stretch = Stretch.Fill };
-                        RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.NearestNeighbor);
-                        _activeImages[(tx, ty)] = img;
-                        MainCanvas.Children.Add(img);
+                    var img = _tileService.GetOrCreateTileImage((tx, ty), MainCanvas);
+                    var bmp = _cacheService.LoadTile(_tilesRoot, _zoom, tx, ty);
+                    if (bmp == null) 
+                    { 
+                        img.Visibility = Visibility.Hidden; 
+                        continue; 
                     }
-                    var bmp = LoadTile(_zoom, tx, ty);
-                    if (bmp == null) { img.Visibility = Visibility.Hidden; continue; }
                     if (!ReferenceEquals(img.Source, bmp)) img.Source = bmp;
-                    PlaceTile(img, tx, ty, drawTileW, drawTileH);
+                    _renderService.PlaceTile(img, tx, ty, drawTileW, drawTileH, _offset, this);
                     img.Visibility = Visibility.Visible;
                 }
             }
-            if (_activeImages.Count > needed.Count)
-            {
-                var remove = new System.Collections.Generic.List<(int, int)>();
-                foreach (var kv in _activeImages) if (!needed.Contains(kv.Key)) remove.Add(kv.Key);
-                foreach (var key in remove) { _activeImages[key].Source = null; MainCanvas.Children.Remove(_activeImages[key]); _activeImages.Remove(key); }
-            }
+            _tileService.RemoveUnusedTiles(needed, MainCanvas);
         }
 
         #region Interaction
         private void MainCanvas_MouseWheel(object sender, MouseWheelEventArgs e)
         {
-            if (!_worldSizeLoaded) return;
-            double old = _scale;
-            _scale *= e.Delta > 0 ? 1.1 : 0.9;
-            if (_scale < _minScale) _scale = _minScale; // 仅保持不小于适配比例
-            System.Windows.Point m = e.GetPosition(MainCanvas);
-            _offset.X = m.X - (m.X - _offset.X) * (_scale / old);
-            _offset.Y = m.Y - (m.Y - _offset.Y) * (_scale / old);
+            if (!_worldService.WorldSizeLoaded) return;
+            var (newScale, newOffset) = _interactionService.HandleMouseWheel(e, MainCanvas, _scale, _minScale, _offset);
+            _scale = newScale;
+            _offset = newOffset;
             MarkTransformDirtyOnly();
             CheckIfRangeChanged();
         }
-        System.Windows.Point _last;
+
         private void MainCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-        { _last = e.GetPosition(this); MainCanvas.CaptureMouse(); }
+        {
+            _interactionService.HandleMouseLeftButtonDown(e, MainCanvas, this);
+        }
+
         private void MainCanvas_MouseMove(object sender, System.Windows.Input.MouseEventArgs e)
         {
+            _offset = _interactionService.HandleMouseMove(e, MainCanvas, _offset, this);
             if (MainCanvas.IsMouseCaptured)
             {
-                System.Windows.Point p = e.GetPosition(this);
-                _offset.X += p.X - _last.X;
-                _offset.Y += p.Y - _last.Y;
-                _last = p;
                 MarkTransformDirtyOnly();
                 CheckIfRangeChanged();
             }
         }
+
         private void MainCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        { MainCanvas.ReleaseMouseCapture(); }
+        {
+            _interactionService.HandleMouseLeftButtonUp(MainCanvas);
+        }
 
         private void ClearCacheBtn_Click(object sender, RoutedEventArgs e)
         {
@@ -398,7 +255,7 @@ namespace StarMapViewer
 
         private void ClearViewBtn_Click(object sender, RoutedEventArgs e)
         {
-            ClearAllActiveTiles();
+            _tileService.ClearAllActiveTiles(MainCanvas);
             MarkTilesDirty();
         }
 
